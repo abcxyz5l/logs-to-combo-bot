@@ -195,20 +195,38 @@ async def download_file(
                         nonlocal downloaded
                         headers = {"Range": f"bytes={rstart}-{rend}"}
                         tmp = part_paths[index]
-                        async with session.get(url, headers=headers, ssl=ssl_setting) as resp:
-                            if resp.status not in (200, 206):
-                                raise RuntimeError(f"Range request failed: {resp.status}")
-                            with open(tmp, "wb") as f:
-                                async for chunk in resp.content.iter_chunked(chunk_size):
-                                    if context.user_data.get("stop_requested"):
-                                        raise _StopRequested()
-                                    if not chunk:
-                                        break
-                                    f.write(chunk)
-                                    async with dl_lock:
-                                        downloaded += len(chunk)
 
-                    async def progress_updater():
+                        # Per-range retry loop and timeouts to avoid hanging on slow/stalled connections
+                        range_attempts = 3
+                        per_req_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
+
+                        for attempt_idx in range(1, range_attempts + 1):
+                            try:
+                                async with session.get(url, headers=headers, timeout=per_req_timeout, ssl=ssl_setting) as resp:
+                                    if resp.status not in (200, 206):
+                                        raise RuntimeError(f"Range request failed: {resp.status}")
+                                    # write to temp part file
+                                    with open(tmp, "wb") as f:
+                                        async for chunk in resp.content.iter_chunked(chunk_size):
+                                            if context.user_data.get("stop_requested"):
+                                                raise _StopRequested()
+                                            if not chunk:
+                                                break
+                                            f.write(chunk)
+                                            async with dl_lock:
+                                                downloaded += len(chunk)
+                                    # completed this range successfully
+                                    return
+                            except _StopRequested:
+                                raise
+                            except Exception:
+                                # on final attempt, re-raise to surface the error
+                                if attempt_idx == range_attempts:
+                                    raise
+                                # otherwise wait a bit and retry
+                                await asyncio.sleep(2 ** attempt_idx)
+
+                    async def progress_updater(done_event: asyncio.Event):
                         nonlocal last_update
                         while True:
                             await asyncio.sleep(1)
@@ -231,38 +249,62 @@ async def download_file(
                             except Exception:
                                 pass
                             last_update = now
-                            if downloaded >= total:
+                            # stop when either we've downloaded all bytes or the done_event is set
+                            if downloaded >= total or done_event.is_set():
                                 break
 
                     tasks = [download_range(i, s, e) for i, (s, e) in enumerate(ranges)]
-                    updater = asyncio.create_task(progress_updater())
+                    done_event = asyncio.Event()
+                    updater = asyncio.create_task(progress_updater(done_event))
                     results = await asyncio.gather(*tasks, return_exceptions=True)
+                    # signal updater to finish and wait for it
+                    done_event.set()
                     await updater
 
                     for r in results:
                         if isinstance(r, Exception):
                             raise r
 
-                    tmp_path = dest_path + ".part"
-                    with open(tmp_path, "wb") as out:
+                    # Verify part sizes before merging; if mismatch, fallback to single-stream
+                    parts_total = 0
+                    good_parts = []
+                    for p in part_paths:
+                        try:
+                            parts_total += os.path.getsize(p)
+                            good_parts.append(p)
+                        except Exception:
+                            pass
+
+                    if total and parts_total != total:
+                        # Cleanup partial parts
                         for p in part_paths:
-                            with open(p, "rb") as pf:
-                                out.write(pf.read())
                             try:
                                 os.remove(p)
                             except Exception:
                                 pass
+                        # Fall back to single-stream download
+                        await progress_message.edit_text("⚠️ Parallel download incomplete; retrying single-stream download...")
+                    else:
+                        tmp_path = dest_path + ".part"
+                        with open(tmp_path, "wb") as out:
+                            for p in part_paths:
+                                with open(p, "rb") as pf:
+                                    out.write(pf.read())
+                                try:
+                                    os.remove(p)
+                                except Exception:
+                                    pass
 
-                    try:
-                        os.replace(tmp_path, dest_path)
-                    except Exception:
-                        os.rename(tmp_path, dest_path)
+                        try:
+                            os.replace(tmp_path, dest_path)
+                        except Exception:
+                            os.rename(tmp_path, dest_path)
 
-                    try:
-                        await progress_message.edit_text(f"Download complete ✅ (parallel)\nSaved as: `{dest_path}`")
-                    except Exception:
-                        pass
-                    return
+                        try:
+                            await progress_message.edit_text(f"Download complete ✅ (parallel)\nSaved as: `{dest_path}`")
+                        except Exception:
+                            pass
+                        return
 
                 # Fallback: single-stream download
                 async with session.get(url, ssl=ssl_setting) as resp:
