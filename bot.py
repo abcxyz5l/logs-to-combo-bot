@@ -15,6 +15,11 @@ from telegram.ext import (
     filters,
 )
 
+
+class _StopRequested(BaseException):
+    """Raised when user sends /stop during download or processing."""
+
+
 # ==== CONFIG ====
 # On Railway: set BOT_TOKEN in Environment Variables (never commit real token)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
@@ -137,14 +142,12 @@ async def download_file(
 ):
     """Stream download with progress updates to Telegram.
 
-    Enhanced behavior:
-    - Respects system proxy env (trust_env=True)
-    - Retries on transient errors with exponential backoff
-    - On SSL errors, retries once with SSL verification disabled (useful when Windows reports "Access is denied")
+    Tuned for Railway Hobby (8 vCPU / 8 GB RAM): 64 MB chunks, long timeout, minimal progress overhead.
     """
-    chunk_size = 8 * 1024 * 1024  # 8 MB for max download speed
+    # Railway Hobby: 8 GB RAM — use 64 MB chunks for max throughput (fewer syscalls, less Python overhead)
+    chunk_size = 64 * 1024 * 1024  # 64 MB
+    progress_interval = 3  # Update Telegram every 3s to reduce API overhead
 
-    # ssl_setting: None -> default verification, False -> disable verification
     ssl_setting = None
 
     for attempt in range(1, retries + 1):
@@ -152,19 +155,30 @@ async def download_file(
         downloaded = 0
         last_update = start
         try:
-            connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=False)
+            connector = aiohttp.TCPConnector(
+                limit=0,
+                limit_per_host=0,
+                force_close=False,
+            )
             async with aiohttp.ClientSession(trust_env=True, connector=connector) as session:
-                timeout = aiohttp.ClientTimeout(total=300)
-                async with session.get(url, timeout=timeout, ssl=ssl_setting) as resp:
+                # No timeout - run until done or /stop
+                async with session.get(url, ssl=ssl_setting) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}")
 
                     total = int(resp.headers.get("Content-Length", 0))
 
-                    # write to a temp file first to avoid leaving partial file on failures
                     tmp_path = dest_path + ".part"
                     with open(tmp_path, "wb") as f:
                         while True:
+                            if context.user_data.get("stop_requested"):
+                                f.close()
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                                raise _StopRequested()
+
                             chunk = await resp.content.read(chunk_size)
                             if not chunk:
                                 break
@@ -172,8 +186,7 @@ async def download_file(
                             downloaded += len(chunk)
 
                             now = asyncio.get_running_loop().time()
-                            # Update message every 2 seconds or on finish
-                            if now - last_update >= 2 or (total > 0 and downloaded == total):
+                            if now - last_update >= progress_interval or (total > 0 and downloaded == total):
                                 elapsed = now - start
                                 speed = downloaded / elapsed if elapsed > 0 else 0  # bytes/s
                                 speed_mb = speed / 1024 / 1024
@@ -300,6 +313,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/view - See all hit files available\n"
         "/send {num} - Send specific hit file\n"
         "/sendall - Merge all hits and send\n"
+        "/stop - Stop all ongoing downloads and filtering\n"
         "/clear - Clear **your** data (options below)\n"
         "/clearhit - Clear your hit files only\n"
         "/clearraw - Clear your downloaded files only\n"
@@ -317,6 +331,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/view - See all hit files currently available\n"
         "/send {num} - Send specific hit file by number\n"
         "/sendall - Merge all hits into ONE file and send\n"
+        "/stop - Stop all downloads/filtering immediately\n"
         "/clear - Options to clear **your** data\n"
         "/clearhit - Clear your hit files only\n"
         "/clearraw - Delete your downloaded raw files only\n"
@@ -487,12 +502,23 @@ async def clearall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {e}")
 
 
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop all ongoing downloads and processing for this user immediately."""
+    context.user_data["stop_requested"] = True
+    task = context.user_data.get("_background_task")
+    if task and not task.done():
+        task.cancel()
+    await update.message.reply_text("⏹ **Stopped.** All downloads and filtering cancelled.")
+
+
 async def download_and_extract(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, link_num: int, total_links: int, user_id: int):
-    """Download a single file and extract user:pass for all user keywords - CONCURRENT."""
+    """Download a single file and extract user:pass for all user keywords - CONCURRENT. Respects /stop."""
+    if context.user_data.get("stop_requested"):
+        return
+
     keywords = get_keywords(user_id)
     download_dir, _, hits_dir = get_user_dirs(user_id)
     file_name = os.path.basename(url.split("?")[0]) or f"file_{link_num}.txt"
-    # Add suffix to avoid filename conflicts
     base, ext = os.path.splitext(file_name)
     file_name = f"{base}_{link_num}{ext}"
     dest_path = os.path.join(download_dir, file_name)
@@ -501,12 +527,26 @@ async def download_and_extract(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         progress_message = await update.message.reply_text(f"⬇️ **[{link_num}/{total_links}]** Downloading: `{file_name}`\n⏳ Please wait...")
 
-        # Download file
-        await download_file(url, dest_path, progress_message, context)
+        try:
+            await download_file(url, dest_path, progress_message, context)
+        except _StopRequested:
+            if progress_message:
+                await safe_edit(progress_message, f"⏹ **[{link_num}/{total_links}]** Stopped by user.")
+            return
+
+        if context.user_data.get("stop_requested"):
+            if progress_message:
+                await safe_edit(progress_message, f"⏹ **[{link_num}/{total_links}]** Stopped by user.")
+            return
+
         kw_preview = ", ".join(keywords[:5]) + ("..." if len(keywords) > 5 else "")
         await safe_edit(progress_message, f"⬇️ **[{link_num}/{total_links}]** ✅ Downloaded\n🔍 Extracting keywords: {kw_preview}...")
 
-        # Extract with all user keywords (any match)
+        if context.user_data.get("stop_requested"):
+            if progress_message:
+                await safe_edit(progress_message, f"⏹ **[{link_num}/{total_links}]** Stopped by user.")
+            return
+
         base_name = os.path.splitext(os.path.basename(dest_path))[0]
         result_path = os.path.join(hits_dir, f"{base_name}_{link_num}.txt")
 
@@ -582,47 +622,53 @@ async def process_links_batch(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ No valid links found.")
         return
 
-    # Initialize tracking
     if "hits_files" not in context.user_data:
         context.user_data["hits_files"] = []
 
-    # Notify user - downloads starting in background
-    await update.message.reply_text(f"🚀 **{len(links)} link(s) detected!**\n\n⚡ Starting parallel downloads...\n(You can use /view, /send while downloading!)")
+    context.user_data["stop_requested"] = False
+
+    await update.message.reply_text(
+        f"🚀 **{len(links)} link(s) detected!**\n\n"
+        f"⚡ Starting parallel downloads...\n"
+        f"(Use /view, /send while downloading — /stop to cancel all.)"
+    )
 
     user_id = update.effective_user.id
-    # Create ALL download tasks at once (true parallel)
     download_tasks = []
     for idx, url in enumerate(links, 1):
         task = download_and_extract(update, context, url, idx, len(links), user_id)
         download_tasks.append(task)
 
-    # Run all downloads concurrently WITHOUT waiting for completion
-    # This allows commands to work while downloads happen
     async def background_download():
-        """Run in background - doesn't block other commands."""
-        results = await asyncio.gather(*download_tasks, return_exceptions=True)
-        
-        # Show summary AFTER all complete
-        hits_files = context.user_data.get("hits_files", [])
-        if hits_files:
-            total_hits = sum(count for _, count in hits_files)
-            try:
-                await update.message.reply_text(
-                    f"\n✅ **All {len(download_tasks)} Downloads Complete!**\n\n"
-                    f"📊 Total Hits Found: **{total_hits}**\n"
-                    f"📁 Files: **{len(hits_files)}**\n\n"
-                    f"Use /view to see all\nUse /sendall to merge & send"
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                await update.message.reply_text(f"⚠️ No results. No '{DEFAULT_KEYWORD}' entries found.")
-            except Exception:
-                pass
-    
-    # Launch background task - DON'T await it
-    asyncio.create_task(background_download())
+        """Run in background. Stops when user sends /stop (task cancelled)."""
+        try:
+            results = await asyncio.gather(*download_tasks, return_exceptions=True)
+
+            if context.user_data.get("stop_requested"):
+                return
+
+            hits_files = context.user_data.get("hits_files", [])
+            if hits_files:
+                total_hits = sum(count for _, count in hits_files)
+                try:
+                    await update.message.reply_text(
+                        f"\n✅ **All {len(download_tasks)} Downloads Complete!**\n\n"
+                        f"📊 Total Hits Found: **{total_hits}**\n"
+                        f"📁 Files: **{len(hits_files)}**\n\n"
+                        f"Use /view to see all\nUse /sendall to merge & send"
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await update.message.reply_text(f"⚠️ No results. No hits for your keywords.")
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    bg = asyncio.create_task(background_download())
+    context.user_data["_background_task"] = bg
 
 
 async def view(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -751,6 +797,7 @@ def main():
     app.add_handler(CommandHandler("clearhit", clearhit))
     app.add_handler(CommandHandler("clearraw", clearraw))
     app.add_handler(CommandHandler("clearall", clearall))
+    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("view", view))
     app.add_handler(CommandHandler("sendall", sendall))
     
