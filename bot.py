@@ -150,6 +150,12 @@ async def download_file(
 
     ssl_setting = None
 
+    # Number of parallel range segments to try (can be overridden with env var)
+    try:
+        max_segments = int(os.environ.get("DOWNLOAD_SEGMENTS", "4"))
+    except Exception:
+        max_segments = 4
+
     for attempt in range(1, retries + 1):
         start = asyncio.get_running_loop().time()
         downloaded = 0
@@ -161,7 +167,104 @@ async def download_file(
                 force_close=False,
             )
             async with aiohttp.ClientSession(trust_env=True, connector=connector) as session:
-                # No timeout - run until done or /stop
+                # Query headers to decide if ranged parallel download is possible
+                total = 0
+                accept_ranges = None
+                try:
+                    async with session.head(url, timeout=aiohttp.ClientTimeout(total=15), ssl=ssl_setting) as h:
+                        if h.status in (200, 206):
+                            total = int(h.headers.get("Content-Length", 0) or 0)
+                            accept_ranges = h.headers.get("Accept-Ranges", None)
+                except Exception:
+                    total = 0
+                    accept_ranges = None
+
+                # If server supports ranges and file is reasonably large, do parallel ranged download
+                if accept_ranges == "bytes" and total and total > 2 * 1024 * 1024 and max_segments > 1:
+                    num_segments = min(max_segments, max(1, total // (2 * 1024 * 1024)))
+                    part_paths = [f"{dest_path}.part{i}" for i in range(num_segments)]
+                    ranges = []
+                    for i in range(num_segments):
+                        start_byte = i * (total // num_segments)
+                        end_byte = ((i + 1) * (total // num_segments) - 1) if i < num_segments - 1 else total - 1
+                        ranges.append((start_byte, end_byte))
+
+                    dl_lock = asyncio.Lock()
+
+                    async def download_range(index, rstart, rend):
+                        nonlocal downloaded
+                        headers = {"Range": f"bytes={rstart}-{rend}"}
+                        tmp = part_paths[index]
+                        async with session.get(url, headers=headers, ssl=ssl_setting) as resp:
+                            if resp.status not in (200, 206):
+                                raise RuntimeError(f"Range request failed: {resp.status}")
+                            with open(tmp, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(chunk_size):
+                                    if context.user_data.get("stop_requested"):
+                                        raise _StopRequested()
+                                    if not chunk:
+                                        break
+                                    f.write(chunk)
+                                    async with dl_lock:
+                                        downloaded += len(chunk)
+
+                    async def progress_updater():
+                        nonlocal last_update
+                        while True:
+                            await asyncio.sleep(1)
+                            now = asyncio.get_event_loop().time()
+                            elapsed = now - start
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            speed_mb = speed / 1024 / 1024
+                            total_mb = total / 1024 / 1024 if total else 0
+                            downloaded_mb = downloaded / 1024 / 1024
+                            eta_text = format_timedelta((total - downloaded) / speed) if total and speed > 0 else "unknown"
+                            try:
+                                await progress_message.edit_text(
+                                    "\n".join([
+                                        "📥 Downloading file (parallel)...",
+                                        f"Downloaded: {downloaded_mb:.2f} MB / {total_mb:.2f} MB",
+                                        f"Speed: {speed_mb:.2f} MB/s",
+                                        f"ETA: {eta_text}",
+                                    ])
+                                )
+                            except Exception:
+                                pass
+                            last_update = now
+                            if downloaded >= total:
+                                break
+
+                    tasks = [download_range(i, s, e) for i, (s, e) in enumerate(ranges)]
+                    updater = asyncio.create_task(progress_updater())
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    await updater
+
+                    for r in results:
+                        if isinstance(r, Exception):
+                            raise r
+
+                    tmp_path = dest_path + ".part"
+                    with open(tmp_path, "wb") as out:
+                        for p in part_paths:
+                            with open(p, "rb") as pf:
+                                out.write(pf.read())
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+
+                    try:
+                        os.replace(tmp_path, dest_path)
+                    except Exception:
+                        os.rename(tmp_path, dest_path)
+
+                    try:
+                        await progress_message.edit_text(f"Download complete ✅ (parallel)\nSaved as: `{dest_path}`")
+                    except Exception:
+                        pass
+                    return
+
+                # Fallback: single-stream download
                 async with session.get(url, ssl=ssl_setting) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}")
@@ -212,16 +315,13 @@ async def download_file(
                                 try:
                                     await progress_message.edit_text("\n".join(text_lines))
                                 except Exception:
-                                    # Ignore edit errors (e.g., message too old)
                                     pass
 
                                 last_update = now
 
-                    # move tmp to final path
                     try:
                         os.replace(tmp_path, dest_path)
                     except Exception:
-                        # fallback to rename
                         os.rename(tmp_path, dest_path)
 
             # success
