@@ -24,6 +24,9 @@ class _StopRequested(BaseException):
 # On Railway: set BOT_TOKEN in Environment Variables (never commit real token)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
 
+# Admin ID - only admin can use /restart or /reset command
+ADMIN_IDS = [7678087570]  # Add more admin IDs as needed: [123456789, 987654321]
+
 # Base dir for all data (downloads, hits, keywords.json). On Railway set DATA_DIR to a volume path to persist.
 _ROOT_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 BASE_DOWNLOAD_DIR = os.path.join(_ROOT_DIR, "downloads")
@@ -77,10 +80,30 @@ def get_user_dirs(user_id: int):
 
 # ==== HELPERS ====
 def extract_links(text: str) -> list:
-    """Extract all URLs from text using regex."""
+    """Extract all URLs from text using regex. Supports http and https."""
+    if not text:
+        return []
+    
     url_pattern = r'https?://[^\s]+'
     links = re.findall(url_pattern, text)
-    return [link.rstrip('.,;:)\'"') for link in links]  # Remove trailing punctuation
+    
+    # Clean up links: remove trailing punctuation
+    cleaned_links = []
+    for link in links:
+        # Remove trailing punctuation but keep query params
+        link = link.rstrip('.,;:)\'"')
+        if link and len(link) > 10:  # Minimum URL length check
+            cleaned_links.append(link)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_links = []
+    for link in cleaned_links:
+        if link not in seen:
+            seen.add(link)
+            unique_links.append(link)
+    
+    return unique_links
 
 
 def format_timedelta(seconds: float) -> str:
@@ -446,8 +469,12 @@ def extract_user_pass_multi(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["hits_files"] = []  # List of (file_path, hit_count) tuples
+    
+    user_id = update.effective_user.id
+    is_admin = " (🔐 ADMIN)" if user_id in ADMIN_IDS else ""
+    
     await update.message.reply_text(
-        "Hello! 👋\n"
+        f"Hello! 👋{is_admin}\n"
         "Send download links (http:// or https://) directly or forward messages containing links.\n"
         "I will download and extract user:pass for **your keywords** (set with /kw).\n\n"
         "📝 **Commands:**\n"
@@ -463,10 +490,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📁 Your downloads & hits are saved **per user** — /clear only affects **your** data.\n"
         "You can send multiple links at once! 🚀"
     )
+    print(f"[LOG] User {user_id} started session{is_admin}")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    user_id = update.effective_user.id
+    is_admin = user_id in ADMIN_IDS
+    
+    help_text = (
         "📖 **Available commands:**\n\n"
         "/start - Reset and start a new session\n"
         "/kw - Set or list keywords (multi: /kw word1, word2, word3)\n"
@@ -482,6 +513,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 **Keywords:** /kw to set or list (multi-keyword supported)\n"
         "Just send links or forward messages with links!"
     )
+    
+    # Add admin commands if user is admin
+    if is_admin:
+        help_text += (
+            "\n\n🔐 **ADMIN COMMANDS:**\n"
+            "/restart -🚨 Clear ALL bot data for ALL users (system reset)\n"
+            "/reset - Alias for /restart\n"
+        )
+    
+    await update.message.reply_text(help_text)
 
 
 async def kw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -651,6 +692,75 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task and not task.done():
         task.cancel()
     await update.message.reply_text("⏹ **Stopped.** All downloads and filtering cancelled.")
+
+
+async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: Clear ALL data for ALL users and reset the bot. Use with caution!"""
+    user_id = update.effective_user.id
+    
+    # Check if user is admin
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text(
+            f"❌ **Unauthorized!**\n\n"
+            f"Only admins can use /restart command.\n"
+            f"Your ID: `{user_id}`"
+        )
+        return
+    
+    try:
+        # Clear all directories
+        deleted_total = 0
+        cleared_users = 0
+        
+        for base_dir in [BASE_DOWNLOAD_DIR, BASE_RESULTS_DIR, BASE_HITS_DIR]:
+            try:
+                if os.path.exists(base_dir):
+                    for user_folder in os.listdir(base_dir):
+                        user_path = os.path.join(base_dir, user_folder)
+                        if os.path.isdir(user_path):
+                            for fname in os.listdir(user_path):
+                                fpath = os.path.join(user_path, fname)
+                                try:
+                                    os.remove(fpath)
+                                    deleted_total += 1
+                                except Exception:
+                                    pass
+                            cleared_users += 1
+            except Exception as e:
+                print(f"Error clearing {base_dir}: {e}")
+        
+        # Clear keywords.json
+        keywords_cleared = False
+        try:
+            if os.path.exists(KEYWORDS_JSON):
+                os.remove(KEYWORDS_JSON)
+                keywords_cleared = True
+        except Exception as e:
+            print(f"Error clearing keywords.json: {e}")
+        
+        # Clear all user sessions
+        context.user_data.clear()
+        context.user_data["hits_files"] = []
+        
+        msg = (
+            f"🔄 **System Reset Complete!** ✅\n\n"
+            f"📊 **Cleanup Summary:**\n"
+            f"  • Users affected: {cleared_users}\n"
+            f"  • Files deleted: {deleted_total}\n"
+            f"  • Keywords reset: {'Yes' if keywords_cleared else 'No'}\n\n"
+            f"🚀 Bot is ready for fresh use!"
+        )
+        await update.message.reply_text(msg)
+        print(f"[ADMIN] User {user_id} executed /restart - Cleared {deleted_total} files for {cleared_users} users")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error during restart: {e}")
+        print(f"[ERROR] Restart error: {e}")
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for /restart - Admin only."""
+    await restart_cmd(update, context)
 
 
 async def download_and_extract(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, link_num: int, total_links: int, user_id: int):
@@ -902,9 +1012,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if links:
         # Process detected links
+        print(f"[DEBUG] Found {len(links)} links in message from user {update.effective_user.id}")
         await process_links_batch(update, context, links)
     else:
         # No links found
+        print(f"[DEBUG] No links found in message: {text[:100]}")
         await update.message.reply_text(
             "❌ No links detected.\n\n"
             "Send download links (http:// or https://) or forward messages with links.\n"
@@ -940,6 +1052,8 @@ def main():
     app.add_handler(CommandHandler("clearraw", clearraw))
     app.add_handler(CommandHandler("clearall", clearall))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("restart", restart_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("view", view))
     app.add_handler(CommandHandler("sendall", sendall))
     
